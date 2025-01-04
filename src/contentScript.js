@@ -56,13 +56,15 @@ function createChatInterface() {
   document.body.appendChild(container);
   
   let messageHistory = [
-    { role: 'assistant', content: "Hi! I'm your shopping assistant. How can I help you find the perfect product?" }
+    { role: 'assistant', content: "Hi! I'm Shop Shutup. What are you looking to buy today?" }
   ];
 
   // Add message to chat
   function addMessage(text, isUser = false) {
     const messagesDiv = container.querySelector('#chat-messages');
     const messageDiv = document.createElement('div');
+    
+    // Make links clickable
     messageDiv.style.cssText = `
       margin: 8px 0;
       padding: 8px 12px;
@@ -72,7 +74,55 @@ function createChatInterface() {
         'background: #0066cc; color: white; margin-left: auto;' : 
         'background: white; border: 1px solid #ddd;'}
     `;
-    messageDiv.textContent = text;
+    
+    // Convert [[Product Name|URL]] format to clickable links
+    const linkPattern = /\[\[(.*?)\|(.*?)\]\]/g;
+    const textWithLinks = text.replace(linkPattern, (match, name, url) => {
+      // Validate URL
+      if (!url.startsWith('http')) {
+        // Extract any filter hints from the product name
+        // Example: "Naked Whey [4.5+ stars, $50-100]"
+        const filterHints = {
+          minRating: name.includes('4.5+ stars') ? 4.5 : 4,
+          prime: true  // Default to Prime eligible
+        };
+
+        // Extract price range if mentioned
+        const priceMatch = name.match(/\$(\d+)-(\d+)/);
+        if (priceMatch) {
+          filterHints.minPrice = priceMatch[1] * 100;
+          filterHints.maxPrice = priceMatch[2] * 100;
+        }
+
+        // Clean product name of filter hints
+        const cleanName = name.replace(/\[.*?\]/g, '').trim();
+        
+        // Build search URL with filters
+        const searchUrl = buildSearchUrl(cleanName, filterHints);
+        
+        return `<a href="${searchUrl}" target="_blank" style="
+          color: #0066cc;
+          text-decoration: underline;
+          cursor: pointer;
+        ">${cleanName} (Filtered Search)</a>`;
+      }
+      return `<a href="${url}" target="_blank" style="
+        color: #0066cc;
+        text-decoration: underline;
+        cursor: pointer;
+      ">${name}</a>`;
+    });
+    
+    messageDiv.innerHTML = textWithLinks;
+    
+    // Enable link clicking
+    messageDiv.querySelectorAll('a').forEach(link => {
+      link.addEventListener('click', (e) => {
+        e.preventDefault();
+        window.open(link.href, '_blank');
+      });
+    });
+    
     messagesDiv.appendChild(messageDiv);
     messagesDiv.scrollTop = messagesDiv.scrollHeight;
 
@@ -83,11 +133,20 @@ function createChatInterface() {
     });
   }
 
+  // Show initial greeting
+  addMessage("Hi! I'm Shop Shutup. What are you looking to buy today?", false);
+
   // Handle sending messages
   async function handleSendMessage() {
     const input = container.querySelector('#chat-input');
     const message = input.value.trim();
     if (message) {
+      // Get current page context if on a product page
+      let productContext = '';
+      if (window.location.hostname.includes('amazon.com')) {
+        productContext = getAmazonProductContext();
+      }
+      
       addMessage(message, true);
       input.value = '';
       
@@ -104,7 +163,7 @@ function createChatInterface() {
       
       try {
         // Get AI response
-        const response = await getAIResponse(messageHistory);
+        const response = await getAIResponse(messageHistory, productContext);
         typingDiv.remove();
         addMessage(response);
       } catch (error) {
@@ -143,11 +202,13 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (!chatContainer) {
       console.log('Creating chat interface');  // Debug log
       chatContainer = createChatInterface();
+      console.log('Chat interface created, container:', chatContainer); // Debug log
     }
     
     chatContainer.style.display = 
       chatContainer.style.display === 'none' ? 'block' : 'none';
     console.log('Chat visibility:', chatContainer.style.display);  // Debug log
+    console.log('Messages container:', chatContainer.querySelector('#chat-messages')); // Debug log
     
     sendResponse({ success: true });
   }
@@ -157,3 +218,95 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 });
 
 console.log('Content script loaded');  // Debug log 
+
+function getAmazonProductContext() {
+  try {
+    // Get product title
+    const title = document.getElementById('productTitle')?.textContent.trim() || '';
+    
+    // Get price
+    const priceElement = document.querySelector('.a-price .a-offscreen');
+    const price = priceElement?.textContent.trim() || '';
+    
+    // Get rating
+    const ratingElement = document.querySelector('#acrPopover');
+    const rating = ratingElement?.title.trim() || '';
+    
+    // Get number of reviews
+    const reviewCount = document.getElementById('acrCustomerReviewText')?.textContent.trim() || '';
+    
+    // Get category/breadcrumb
+    const breadcrumb = Array.from(document.querySelectorAll('#wayfinding-breadcrumbs_container .a-link-normal'))
+      .map(el => el.textContent.trim())
+      .join(' > ');
+    
+    // Get product features
+    const features = [];
+    document.querySelectorAll('#feature-bullets .a-list-item').forEach((item, index) => {
+      const feature = item.textContent.trim();
+      if (feature) features.push(feature);
+    });
+    
+    // Get review highlights
+    const reviewHighlights = [];
+    document.querySelectorAll('div[data-hook="review-collapsed"] .review-text').forEach((item, index) => {
+      if (index < 5) { // Get top 5 reviews
+        const highlight = item.textContent.trim();
+        if (highlight) reviewHighlights.push(highlight);
+      }
+    });
+    
+    // Format the context
+    const context = `
+Product: ${title}
+Category: ${breadcrumb}
+Price: ${price}
+Rating: ${rating} (${reviewCount})
+
+Key Features:
+${features.map(f => `• ${f}`).join('\n')}
+
+Recent Reviews:
+${reviewHighlights.map(h => `• ${h}`).join('\n')}
+    `.trim();
+    
+    console.log('Product Context:', context); // Debug log
+    return context;
+  } catch (error) {
+    console.error('Error getting product context:', error);
+    return '';
+  }
+} 
+
+function buildSearchUrl(productName, filters = {}) {
+  const baseUrl = 'https://www.amazon.com/s';
+  const searchParams = new URLSearchParams({
+    k: productName,
+    rh: buildFilterString(filters)
+  });
+
+  return `${baseUrl}?${searchParams.toString()}`;
+}
+
+function buildFilterString(filters) {
+  const filterParts = [];
+  
+  // Price range
+  if (filters.minPrice) {
+    // Add 20% buffer to price range
+    const minPrice = Math.floor(filters.minPrice * 0.8);  // 20% below
+    const maxPrice = filters.maxPrice ? Math.ceil(filters.maxPrice * 1.2) : '';  // 20% above
+    filterParts.push(`p_36:${minPrice}-${maxPrice}`);
+  }
+  
+  // Average rating
+  if (filters.minRating) filterParts.push(`p_72:${filters.minRating}00-`);
+  
+  // Prime eligible
+  if (filters.prime) filterParts.push('p_85:2470955011');
+  
+  // Department/category
+  if (filters.department) filterParts.push(`n:${filters.department}`);
+  
+  return filterParts.join('|');
+} 
